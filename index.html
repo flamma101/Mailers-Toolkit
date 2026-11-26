@@ -259,7 +259,7 @@ const TOOLS=[
  run(t,c){
    if(!t.trim())return{error:'Paste or import HTML first.'};
    const doc=new DOMParser().parseFromString(t,'text/html');
-   const as=[...doc.querySelectorAll('[href]')];
+   const as=[...doc.querySelectorAll('a[href]')];
    as.forEach(a=>a.setAttribute('href',''));
    const changed=as.length;
    const out=/<(html|head)[\s>]/i.test(t)?doc.documentElement.outerHTML:(doc.head.innerHTML.trim()?doc.head.innerHTML+'\n':'')+doc.body.innerHTML;
