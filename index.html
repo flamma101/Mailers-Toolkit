@@ -264,8 +264,94 @@ const TOOLS=[
    const changed=as.length;
    const out=/<(html|head)[\s>]/i.test(t)?doc.documentElement.outerHTML:(doc.head.innerHTML.trim()?doc.head.innerHTML+'\n':'')+doc.body.innerHTML;
    return{out,stats:{'Links found':as.length,'Links changed':changed}};
- }}
+ }},
+
+{id:'speed',group:'Calculators',name:'Sending Speed Calculator',custom:true,
+ desc:'Work out the exact delay between messages to spread a send evenly over a period.'}
 ];
+
+const SPEED_DEFAULTS={n:'500',b:'1',d:'1',h:'0',m:'0',s:'0'};
+function fmtNum(x,dp){return x.toLocaleString('en-US',{maximumFractionDigits:dp})}
+function plural(n,w){return `${fmtNum(n,3)} ${w}${n===1?'':'s'}`}
+function formatDuration(ms){
+  let sec=ms/1000;
+  let h=Math.floor(sec/3600);
+  let m=Math.floor((sec-h*3600)/60);
+  let s=Math.round((sec-h*3600-m*60)*1000)/1000;
+  if(s>=60){s=0;m++}
+  if(m>=60){m=0;h++}
+  const out=[];
+  if(h)out.push(plural(h,'hour'));
+  if(m)out.push(plural(m,'minute'));
+  if(s>0||!out.length)out.push(plural(s,'second'));
+  return out.join(', ');
+}
+function setSpeedInputs(v){el('sp-n').value=v.n;el('sp-b').value=v.b;el('sp-d').value=v.d;el('sp-h').value=v.h;el('sp-m').value=v.m;el('sp-s').value=v.s}
+function calcSpeed(){
+  const raw=id=>el(id).value.trim();
+  const nRaw=raw('sp-n'),N=Number(nRaw);
+  const bRaw=raw('sp-b'),B=Number(bRaw);
+  const labels={d:'Days',h:'Hours',m:'Minutes',s:'Seconds'};
+  const parts={d:Number(raw('sp-d')),h:Number(raw('sp-h')),m:Number(raw('sp-m')),s:Number(raw('sp-s'))};
+  const nOk=nRaw!==''&&Number.isInteger(N)&&N>=1;
+  const errs=[];
+  if(!nOk)errs.push('Total messages must be a whole number of at least 1.');
+  if(bRaw===''||!Number.isInteger(B)||B<1)errs.push('Messages per batch must be a whole number of at least 1.');
+  else if(nOk&&B>N)errs.push(`Messages per batch cannot exceed the total of ${fmtNum(N,0)}.`);
+  for(const k of Object.keys(labels)){
+    if(raw('sp-'+k)===''||!Number.isFinite(parts[k])||parts[k]<0)errs.push(`${labels[k]} must be zero or more.`);
+  }
+  const res=el('sp-res'),copy=el('sp-copy'),big=el('sp-big');
+  if(errs.length){
+    setMsg(errs.join(' '),'err');res.innerHTML='';big.innerHTML='';copy.dataset.value='';return;
+  }
+  const totalMs=((parts.d*24+parts.h)*60+parts.m)*60000+parts.s*1000;
+  if(totalMs<=0){
+    setMsg('The sending period must be greater than zero.','err');res.innerHTML='';big.innerHTML='';copy.dataset.value='';return;
+  }
+  const intervals=Math.ceil(N/B);
+  const adjusted=totalMs/intervals;
+  const single=totalMs/N;
+  const whole=Math.round(adjusted);
+  const perSec=N*1000/totalMs;
+  big.innerHTML=`<div style="color:var(--muted);font-size:14px">Adjusted delay between batches</div><div style="font:600 32px Georgia,'Iowan Old Style',serif;margin:4px 0 12px">${fmtNum(adjusted,6)} ms</div>`;
+  const rows=[
+    ['Whole milliseconds (copied)',fmtNum(whole,0)],
+    ['Delay in seconds',fmtNum(adjusted/1000,6)+' s'],
+    ['Equivalent interval',formatDuration(adjusted)],
+    ['Batches per period',fmtNum(intervals,0)],
+    ['Single-message interval (reference)',fmtNum(single,6)+' ms'],
+    ['Messages per second',fmtNum(perSec,6)],
+    ['Messages per minute',fmtNum(perSec*60,4)],
+    ['Messages per hour',fmtNum(perSec*3600,2)]
+  ];
+  res.innerHTML=rows.map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+  copy.dataset.value=String(whole);
+  if(whole===0)setMsg('The adjusted delay is under 0.5 ms, so it rounds to 0. Use fewer batches or a longer period.','warn');
+  else setMsg('');
+}
+function mountSpeed(root){
+  root.innerHTML=`
+  <header class="head"><h1>Sending Speed Calculator</h1><p>Find the exact delay between messages needed to spread a set number of sends evenly over a period.</p>
+    <details class="how"><summary>How to use</summary><ol><li>Enter the total number of messages.</li><li>Enter the sending period in days, hours, minutes, and seconds.</li><li>Results update as you type.</li><li>Click Copy whole ms to take the delay into your sending application.</li></ol></details></header>
+  <form class="controls" onsubmit="return false">
+    <label>Total messages <input type="number" id="sp-n" min="1" step="1" value="${SPEED_DEFAULTS.n}"></label>
+    <label>Days <input type="number" id="sp-d" min="0" step="any" value="${SPEED_DEFAULTS.d}"></label>
+    <label>Hours <input type="number" id="sp-h" min="0" step="any" value="${SPEED_DEFAULTS.h}"></label>
+    <label>Minutes <input type="number" id="sp-m" min="0" step="any" value="${SPEED_DEFAULTS.m}"></label>
+    <label>Seconds <input type="number" id="sp-s" min="0" step="any" value="${SPEED_DEFAULTS.s}"></label>
+    <label>Messages per batch <input type="number" id="sp-b" min="1" step="1" value="${SPEED_DEFAULTS.b}"></label>
+  </form>
+  <div id="msg" role="status"></div>
+  <div id="sp-big"></div>
+  <dl class="stats" id="sp-res"></dl>
+  <div class="row actions"><button class="primary" id="sp-copy">Copy whole ms</button><button id="sp-reset">Reset</button></div>
+  <p class="hint">This result assumes evenly spaced sending intervals: each message goes out exactly the calculated delay after the previous one. Real sending adds queue time, retries, and processing delays, so treat the result as a target schedule rather than a guarantee.</p>`;
+  root.querySelector('form').addEventListener('input',calcSpeed);
+  el('sp-reset').onclick=()=>{setSpeedInputs(SPEED_DEFAULTS);calcSpeed()};
+  el('sp-copy').onclick=()=>copyText(el('sp-copy').dataset.value||'');
+  calcSpeed();
+}
 
 /* ---------- rendering ---------- */
 let current=null;
@@ -278,6 +364,7 @@ function renderTool(id){
   current=t;
   document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.id===t.id));
   try{localStorage.setItem('mt-last',t.id)}catch(e){}
+  if(t.custom){el('ws').innerHTML='';mountSpeed(el('ws'));return}
   el('ws').innerHTML=`
   <header class="head"><h1>${t.name}</h1><p>${t.desc}</p>
     <details class="how"><summary>How to use</summary><ol>${t.how.map(h=>`<li>${h}</li>`).join('')}</ol></details></header>
