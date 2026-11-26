@@ -252,17 +252,16 @@ const TOOLS=[
  }},
 
 {id:'links',group:'Email & HTML',name:'Remove Links from HTML',input:true,preview:true,exports:['html'],
- desc:'Strip link destinations or whole link elements from HTML while keeping the rest.',
- how:['Paste HTML or drop in an .html file.','Choose whether to remove only the link or the whole link element.','Click Process, then copy or export the result.','Absolute, relative, and mailto links are all handled.'],
- action:'Remove links',
- controls:`<label>Mode <select id="m" style="width:auto"><option value="href">Remove the link only (keep the text and HTML around it)</option><option value="el">Remove the whole &lt;a&gt; element and its contents</option></select></label>`,
+ desc:'Blank out every href value in HTML while keeping all other markup.',
+ how:['Paste HTML or drop in an .html file.','Click Process. Every href value is replaced with an empty string.','Anchor tags, link text, classes, styles, and other attributes are kept.','Absolute, relative, and mailto links are all handled.'],
+ action:'Blank hrefs',
+ controls:'',
  run(t,c){
    if(!t.trim())return{error:'Paste or import HTML first.'};
    const doc=new DOMParser().parseFromString(t,'text/html');
-   const as=[...doc.querySelectorAll('a')];
-   const mode=c('m').value;
-   const changed=mode==='el'?as.length:as.filter(a=>a.hasAttribute('href')).length;
-   if(mode==='el')as.forEach(a=>a.remove());else as.forEach(a=>a.removeAttribute('href'));
+   const as=[...doc.querySelectorAll('[href]')];
+   as.forEach(a=>a.setAttribute('href',''));
+   const changed=as.length;
    const out=/<(html|head)[\s>]/i.test(t)?doc.documentElement.outerHTML:(doc.head.innerHTML.trim()?doc.head.innerHTML+'\n':'')+doc.body.innerHTML;
    return{out,stats:{'Links found':as.length,'Links changed':changed}};
  }}
