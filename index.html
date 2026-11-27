@@ -369,13 +369,63 @@ function hpLocate(target,v){
   }
   return{review:'Unknown partial target.'};
 }
-// Applies one rule to one unfolded header value. Returns {ok,newValue,info} or {ok:false,reason}.
+// Checks explicit placeholders in a pattern. Named placeholders such as [mid] are passed through.
+// Random-form placeholders [min_max_TYPE] must have a valid length range and a supported type.
+function hpCheckPattern(p){
+  const open=(p.match(/\[/g)||[]).length,close=(p.match(/\]/g)||[]).length;
+  if(open!==close)return 'The pattern has unbalanced square brackets, so a placeholder is incomplete.';
+  const types=['A','a','Aa','AaN','AN','aN','N','NaA','NaA_b64'];
+  for(const t of p.match(/\[[^\[\]]*\]/g)||[]){
+    const m=/^\[(\d+)_(\d+)_([A-Za-z_]+)\]$/.exec(t);
+    if(!m)continue;
+    const min=+m[1],max=+m[2];
+    if(min<1||min>max)return `${t} needs a length from 1 up to its maximum, with the minimum not greater than the maximum.`;
+    if(!types.includes(m[3]))return `${t} uses an unsupported character type. Use A, a, Aa, AaN, AN, aN, or N.`;
+  }
+  return null;
+}
+// Message-ID structure detector. Expected shape: <prefix>-<4 alnum, kept>-<4 digits>-<4 lowercase+digits>-<rest, kept>.
+// Only the digit group and the lowercase+digit group are randomized. Any other shape returns null.
+function hpMidStructure(local){
+  const m=/^([A-Za-z0-9]{8,})-([a-z0-9]{4})-([0-9]{4})-([a-z0-9]{4})-([A-Za-z0-9_]+)$/.exec(local);
+  if(!m)return null;
+  const a=hpTagInfo(m[3]),b=hpTagInfo(m[4]);
+  if(!a||!b||a.type!=='N'||b.type!=='aN')return null;
+  return{text:`${m[1]}-${m[2]}-${a.tag}-${b.tag}-${m[5]}`,infos:[a,b]};
+}
+// Generic Message-ID detector for local parts with dot or hyphen separators.
+// Order: 1) the hyphen profile above, if it matches; 2) otherwise one segment only.
+// Eligible segments are numeric-only segments of at least 4 digits. Lowercase alphanumeric segments are
+// not eligible here because their position cannot be confirmed from a single segment.
+// Selection: the longest eligible segment. On equal length, the LEFTMOST segment wins (deterministic).
+// Returns {text,infos} when a segment is replaced, {reason} when separators exist but nothing is eligible,
+// or null when the local part has no separators (the caller then uses the whole-value rule).
+function hpMidAuto(local){
+  const profile=hpMidStructure(local);
+  if(profile)return{text:profile.text,infos:profile.infos};
+  if(!/[.-]/.test(local))return null;
+  const parts=local.split(/([.-])/);   // even indexes are segments, odd indexes are separators
+  let best=-1;
+  for(let i=0;i<parts.length;i+=2){
+    if(/^[0-9]{4,}$/.test(parts[i])&&(best<0||parts[i].length>parts[best].length))best=i;
+  }
+  if(best<0)return{reason:'This Message-ID has no eligible numeric segment of 4 or more digits, so it was left unchanged. Use a custom rule or an explicit pattern.'};
+  const info=hpTagInfo(parts[best]);
+  parts[best]=info.tag;
+  return{text:parts.join(''),infos:[info]};
+}
+// Applies one rule to one unfolded header value. Returns {ok,newValue,infos} or {ok:false,reason}.
+// Explicit patterns are used exactly as written and never trigger automatic detection.
 function hpApply(rule,value){
+  if(rule.source==='pattern'){
+    const pe=hpCheckPattern(rule.value);
+    if(pe)return{ok:false,reason:pe};
+  }
   if(rule.mode==='full'){
     if(rule.source==='auto'){
       const info=hpTagInfo(value.trim());
-      if(!info)return{ok:false,reason:'The value is empty or contains characters other than letters and numbers, so an automatic tag cannot be chosen.'};
-      return{ok:true,newValue:info.tag,info};
+      if(!info)return{ok:false,reason:'The value is empty or contains characters other than letters and numbers, so an automatic tag cannot be chosen. Use an explicit placeholder pattern instead.'};
+      return{ok:true,newValue:info.tag,infos:[info]};
     }
     if(rule.parse==='from'){
       const f=hpParseFrom(value);
@@ -386,15 +436,22 @@ function hpApply(rule,value){
   }
   const loc=hpLocate(rule.target,value);
   if(loc.review)return{ok:false,reason:loc.review};
-  let rep=rule.value,info=null;
+  let rep=rule.value,infos=[];
   if(rule.source==='auto'){
-    info=hpTagInfo(loc.text);
-    if(!info)return{ok:false,reason:`The targeted part "${loc.text}" contains characters other than letters and numbers, so an automatic tag cannot be chosen.`};
-    rep=info.tag;
+    const isMid=/^message-id$/i.test(rule.header);
+    const ma=isMid?hpMidAuto(loc.text):null;
+    if(ma&&ma.reason)return{ok:false,reason:ma.reason};
+    if(ma){
+      rep=ma.text;infos=ma.infos;
+    }else{
+      const info=hpTagInfo(loc.text);
+      if(!info)return{ok:false,reason:`The targeted part "${loc.text}" contains characters other than letters and numbers, so an automatic tag cannot be chosen. Use an explicit placeholder pattern instead.`};
+      rep=info.tag;infos=[info];
+    }
   }
   if(rule.target!=='display-name'&&/[<>@\s]/.test(rep))return{ok:false,reason:'The replacement contains <, >, @ or a space, which would break the address structure.'};
   if(/[<>]/.test(rep))return{ok:false,reason:'The replacement contains < or >.'};
-  return{ok:true,newValue:value.slice(0,loc.start)+rep+value.slice(loc.end),info};
+  return{ok:true,newValue:value.slice(0,loc.start)+rep+value.slice(loc.end),infos};
 }
 function hpValidateRule(r){
   if(!r||typeof r!=='object')return 'Rule is not an object.';
@@ -402,9 +459,10 @@ function hpValidateRule(r){
   if(!h)return 'Header name is required.';
   if(!/^[!-9;-~]+$/.test(h))return `"${h}" is not a valid header name (no spaces or colons).`;
   if(r.mode!=='full'&&r.mode!=='partial')return 'Mode must be Full Value or Partial Value.';
-  if(!['placeholder','custom','auto'].includes(r.source))return 'Replacement type is invalid.';
+  if(!['placeholder','custom','auto','pattern'].includes(r.source))return 'Replacement type is invalid.';
   if(r.mode==='partial'&&!(typeof r.target==='string'&&hpOwn(HP_TARGETS,r.target)))return 'Partial rules need a target, such as the local part inside <local@domain>.';
   if(r.source!=='auto'&&(typeof r.value!=='string'||!r.value.trim()))return 'Replacement value is empty.';
+  if(r.source==='pattern'){const pe=hpCheckPattern(r.value);if(pe)return pe;}
   if(r.enabled!==undefined&&typeof r.enabled!=='boolean')return 'Enabled must be true or false.';
   if(r.parse!==undefined&&r.parse!=='from')return 'Unknown parse option.';
   return null;
@@ -478,7 +536,7 @@ function hpRun(input){
     if(!r.ok){attention.push({field:b.name,rule:idx,original:value,reason:r.reason});keep();continue}
     personalized++;
     ruleStats[idx].applied++;
-    if(r.info){tags++;infos.push(r.info)}
+    if(r.infos&&r.infos.length){tags+=r.infos.length;infos.push(...r.infos)}
     out.push({t:`${b.name}:${ws}${r.newValue}`,hl:true});
     reps.push({field:b.name,original:value,value:r.newValue,rule:idx});
   }
@@ -550,7 +608,8 @@ function hpEdSync(){
   el('ed-value-wrap').hidden=auto;
   el('ed-ph-wrap').hidden=auto;
   let hint='';
-  if(auto)hint='Automatic random tag: the tag is built from the length and character types of the original value. No random value is generated here.';
+  if(el('ed-source').value==='pattern')hint='Explicit pattern: the text is kept exactly as typed. Placeholders such as [4_4_N] are passed through for the mailer to fill, each one independently.';
+  else if(auto)hint='Automatic random tag: the tag is built from the length and character types of the original value. No random value is generated here.';
   else if(partial)hint=`Only the chosen part is replaced: ${HP_TARGETS[el('ed-target').value]}. Everything else stays as it is.`;
   else hint='Full value: the whole header value is replaced.';
   el('ed-hint').textContent=hint;
@@ -644,7 +703,7 @@ function mountHeaders(root){
           <label>Header name <input type="text" id="ed-header" placeholder="e.g. Return-Path" style="width:220px"></label>
           <label>Mode <select id="ed-mode"><option value="full">Full Value</option><option value="partial">Partial Value</option></select></label>
           <label id="ed-target-wrap" hidden>Target <select id="ed-target"><option value="angle-local">Local part inside &lt;local@domain&gt;</option><option value="email-local">Local part of a bare email</option><option value="display-name">Display name before &lt;email&gt;</option></select></label>
-          <label>Replacement type <select id="ed-source"><option value="placeholder">Existing placeholder</option><option value="custom">Custom text</option><option value="auto">Automatic random tag</option></select></label>
+          <label>Replacement type <select id="ed-source"><option value="placeholder">Existing placeholder</option><option value="custom">Custom text</option><option value="auto">Automatic random tag</option><option value="pattern">Explicit placeholder pattern</option></select></label>
           <label><input type="checkbox" id="ed-enabled" checked> Enabled</label>
         </div>
         <div id="ed-ph-wrap">
@@ -703,7 +762,7 @@ function mountHeaders(root){
   el('ed-source').onchange=hpEdSync;
   el('ed-target').onchange=hpEdSync;
   el('ed-ph-q').oninput=hpPhList;
-  el('ed-ph').onchange=e=>{el('ed-value').value=e.target.value;el('ed-source').value='placeholder';hpEdSync()};
+  el('ed-ph').onchange=e=>{if(el('ed-source').value==='pattern'){el('ed-value').value+=e.target.value}else{el('ed-value').value=e.target.value;el('ed-source').value='placeholder'}hpEdSync()};
   el('ed-save').onclick=hpEdSave;
   el('ed-cancel').onclick=()=>{el('hp-editor').hidden=true};
   el('hp-run').onclick=hpRunUI;
