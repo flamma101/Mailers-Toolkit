@@ -266,9 +266,141 @@ const TOOLS=[
    return{out,stats:{'Links found':as.length,'Links changed':changed}};
  }},
 
-{id:'speed',group:'Calculators',name:'Sending Speed Calculator',custom:true,
- desc:'Work out the exact delay between messages to spread a send evenly over a period.'}
+{id:'speed',group:'Calculators',name:'Sending Speed Calculator',mount:mountSpeed,
+ desc:'Work out the exact delay between messages to spread a send evenly over a period.'},
+
+{id:'headers',group:'Email & HTML',name:'Raw Email Header Personalizer',mount:mountHeaders,
+ desc:'Replace source-specific Gmail header values with mailer tags, leaving all other headers untouched.'}
 ];
+
+/* ---------- raw email header personalizer ---------- */
+const HP_FIXED={date:'[Date]',subject:'[Subject]',to:'[To]'};
+const HP_MARK='<mark style="background:color-mix(in srgb,var(--accent) 28%,transparent);color:inherit;border-radius:3px">';
+let hpPlain='';
+function hpEsc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function hpCharType(s){
+  if(!s||!/^[A-Za-z0-9]+$/.test(s))return null;
+  return (/[A-Z]/.test(s)?'A':'')+(/[a-z]/.test(s)?'a':'')+(/[0-9]/.test(s)?'N':'');
+}
+function hpParseFrom(v){
+  const m=/^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.exec(v);
+  if(m)return{email:m[2]};
+  if(/^[^\s<>"@]+@[^\s<>"@]+$/.test(v))return{bare:true,email:v};
+  return{review:'From value is neither "Name <email>" nor a plain email address.'};
+}
+function hpParseMessageId(v){
+  const m=/<([^<>@\s]+)@([^<>\s]+)>/.exec(v);
+  if(!m)return{review:'Message-ID does not contain a <local@domain> value.'};
+  const local=m[1],type=hpCharType(local);
+  if(!type)return{review:`The dynamic part "${local}" contains characters other than letters and numbers, so its type cannot be classified.`};
+  const n=local.length,tag=`[${n}_${n}_${type}]`;
+  return{
+    tag,
+    value:v.slice(0,m.index)+`<${tag}@${m[2]}>`+v.slice(m.index+m[0].length),
+    analysis:{local,len:n,upper:/[A-Z]/.test(local),lower:/[a-z]/.test(local),nums:/[0-9]/.test(local),type,tag}
+  };
+}
+function hpUnfold(b){
+  const first=b.lines[0],rest=first.slice(first.indexOf(':')+1);
+  const ws=/^[ \t]*/.exec(rest)[0];
+  const parts=[rest.trim(),...b.lines.slice(1).map(l=>l.trim())].filter(Boolean);
+  return{value:parts.join(' '),ws};
+}
+function hpRun(input){
+  if(!input.trim())return{error:'Paste the original headers first.'};
+  const eol=input.includes('\r\n')?'\r\n':'\n';
+  const blocks=[];
+  for(const line of input.split(/\r\n|\n/)){
+    const prev=blocks[blocks.length-1];
+    if(prev&&prev.name&&/^[ \t]/.test(line)){prev.lines.push(line);continue}
+    const m=/^([!-9;-~]+):/.exec(line);
+    blocks.push({lines:[line],name:m?m[1]:null});
+  }
+  const out=[],replacements=[],review=[],analyses=[];
+  let total=0,personalized=0,tags=0;
+  for(const b of blocks){
+    const key=b.name?b.name.toLowerCase():null;
+    if(!key){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    total++;
+    const isFixed=Object.prototype.hasOwnProperty.call(HP_FIXED,key);
+    if(!isFixed&&key!=='from'&&key!=='message-id'){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    const{value,ws}=hpUnfold(b);
+    let newValue=null;
+    if(isFixed)newValue=HP_FIXED[key];
+    else if(key==='from'){
+      const f=hpParseFrom(value);
+      if(f.review)review.push({field:b.name,original:value,reason:f.review});
+      else newValue=f.bare?'[fromEmail]':'[fromName] <[fromEmail]>';
+    }else{
+      const mi=hpParseMessageId(value);
+      if(mi.review)review.push({field:b.name,original:value,reason:mi.review});
+      else{newValue=mi.value;tags++;analyses.push(mi.analysis)}
+    }
+    if(newValue===null){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    personalized++;
+    out.push({t:`${b.name}:${ws}${newValue}`,hl:true});
+    replacements.push({field:b.name,original:value,value:newValue});
+  }
+  return{
+    plain:out.map(x=>x.t).join(eol),
+    html:out.map(x=>x.hl?HP_MARK+hpEsc(x.t)+'</mark>':hpEsc(x.t)).join('\n'),
+    replacements,review,analyses,
+    stats:{'Headers detected':total,'Personalized':personalized,'Random tags generated':tags,'Preserved unchanged':total-personalized,'Needs review':review.length}
+  };
+}
+function hpClear(){
+  el('hp-in').value='';hpPlain='';
+  el('hp-out').innerHTML='';el('hp-stats').innerHTML='';
+  el('hp-rep').innerHTML='';el('hp-tag').innerHTML='';el('hp-rev').innerHTML='';
+  setMsg('');
+}
+function hpRunUI(){
+  const r=hpRun(el('hp-in').value);
+  if(r.error){
+    setMsg(r.error,'err');toast(r.error,'err');
+    hpPlain='';el('hp-out').innerHTML='';el('hp-stats').innerHTML='';
+    el('hp-rep').innerHTML='';el('hp-tag').innerHTML='';el('hp-rev').innerHTML='';
+    return;
+  }
+  hpPlain=r.plain;
+  el('hp-out').innerHTML=r.html;
+  el('hp-stats').innerHTML=Object.entries(r.stats).map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+  el('hp-rep').innerHTML=r.replacements.length
+    ?r.replacements.map(x=>`<div style="margin-bottom:6px"><b>${hpEsc(x.field)}</b>: <code>${hpEsc(x.original)}</code> → <code>${hpEsc(x.value)}</code></div>`).join('')
+    :'No headers were personalized.';
+  el('hp-tag').innerHTML=r.analyses.length
+    ?r.analyses.map(a=>`<dl class="stats" style="margin-bottom:8px"><div><dt>Dynamic part</dt><dd>${hpEsc(a.local)}</dd></div><div><dt>Length</dt><dd>${a.len}</dd></div><div><dt>Uppercase</dt><dd>${a.upper?'Yes':'No'}</dd></div><div><dt>Lowercase</dt><dd>${a.lower?'Yes':'No'}</dd></div><div><dt>Numbers</dt><dd>${a.nums?'Yes':'No'}</dd></div><div><dt>Type</dt><dd>${a.type}</dd></div><div><dt>Tag</dt><dd>${hpEsc(a.tag)}</dd></div></dl>`).join('')
+    :'No Message-ID was found to analyze.';
+  el('hp-rev').innerHTML=r.review.length
+    ?r.review.map(x=>`<div style="margin-bottom:8px"><b>${hpEsc(x.field)}</b>: ${hpEsc(x.reason)}<br><code>${hpEsc(x.original)}</code></div>`).join('')
+    :'Nothing needs review.';
+  if(r.review.length)setMsg(`${r.review.length} header(s) could not be confidently classified and were left unchanged. See Needs review.`,'warn');
+  else setMsg('');
+  toast('Headers personalized');
+}
+function mountHeaders(root){
+  root.innerHTML=`
+  <header class="head"><h1>Raw Email Header Personalizer</h1><p>Paste Gmail Show original headers and replace the source-specific values with mailer tags. All other headers are kept exactly as provided.</p>
+    <details class="how"><summary>How to use</summary><ol><li>Paste the full header block from Gmail Show original.</li><li>Click Personalize Headers.</li><li>Check the replacements and the Message-ID tag analysis.</li><li>Review anything under Needs review, then click Copy Result.</li></ol></details></header>
+  <section class="io"><label><span>Original headers</span><textarea id="hp-in" spellcheck="false" style="min-height:220px" placeholder="Paste the raw headers here, for example Date:, From:, Message-ID:, Subject:, To:"></textarea></label>
+    <div class="row"><button id="hp-paste">Paste</button><button id="hp-clear">Clear</button></div></section>
+  <div class="row actions"><button class="primary" id="hp-run">Personalize Headers</button><button id="hp-copy">Copy Result</button><button id="hp-clear2">Clear</button></div>
+  <div id="msg" role="status"></div>
+  <dl class="stats" id="hp-stats"></dl>
+  <section class="out"><span style="display:block;font-size:14px;color:var(--muted);margin:12px 0 4px">Personalized output (replaced values highlighted)</span>
+    <pre id="hp-out" style="border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:12px;white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:160px;margin:0"></pre></section>
+  <details open style="margin-top:14px"><summary>Replacements</summary><div id="hp-rep" class="hint" style="margin-top:8px"></div></details>
+  <details open style="margin-top:10px"><summary>Message-ID tag analysis</summary><div id="hp-tag" class="hint" style="margin-top:8px"></div></details>
+  <details style="margin-top:10px"><summary>Needs review</summary><div id="hp-rev" class="hint" style="margin-top:8px"></div></details>`;
+  el('hp-run').onclick=hpRunUI;
+  el('hp-clear').onclick=hpClear;
+  el('hp-clear2').onclick=hpClear;
+  el('hp-copy').onclick=()=>copyText(hpPlain);
+  el('hp-paste').onclick=()=>{
+    if(!navigator.clipboard||!navigator.clipboard.readText){toast('Paste is not available here. Use Ctrl/Cmd+V in the box.','err');return}
+    navigator.clipboard.readText().then(t=>{el('hp-in').value=t},()=>toast('The browser blocked paste. Use Ctrl/Cmd+V in the box.','err'));
+  };
+}
 
 const SPEED_DEFAULTS={n:'500',b:'1',d:'1',h:'0',m:'0',s:'0'};
 function fmtNum(x,dp){return x.toLocaleString('en-US',{maximumFractionDigits:dp})}
@@ -364,7 +496,7 @@ function renderTool(id){
   current=t;
   document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.id===t.id));
   try{localStorage.setItem('mt-last',t.id)}catch(e){}
-  if(t.custom){el('ws').innerHTML='';mountSpeed(el('ws'));return}
+  if(t.mount){el('ws').innerHTML='';t.mount(el('ws'));return}
   el('ws').innerHTML=`
   <header class="head"><h1>${t.name}</h1><p>${t.desc}</p>
     <details class="how"><summary>How to use</summary><ol>${t.how.map(h=>`<li>${h}</li>`).join('')}</ol></details></header>
