@@ -278,37 +278,176 @@ const TOOLS=[
 ];
 
 /* ---------- raw email header personalizer ---------- */
-const HP_FIXED={date:'[Date]',subject:'[Subject]',to:'[To]'};
+const HP_STORE='mt-hdr-rules';
 const HP_MARK='<mark style="background:color-mix(in srgb,var(--accent) 28%,transparent);color:inherit;border-radius:3px">';
-let hpPlain='';
+const HP_TARGETS={'angle-local':'Local part inside <local@domain>','email-local':'Local part of a bare email address','display-name':'Display name before <email>'};
+const HP_DEFAULTS=[
+ {header:'Date',mode:'full',source:'placeholder',value:'[Date]',enabled:true},
+ {header:'From',mode:'full',source:'custom',value:'[fromName] <[fromEmail]>',parse:'from',enabled:true},
+ {header:'Subject',mode:'full',source:'placeholder',value:'[Subject]',enabled:true},
+ {header:'To',mode:'full',source:'placeholder',value:'[To]',enabled:true},
+ {header:'Message-ID',mode:'partial',target:'angle-local',source:'auto',value:'',enabled:true}
+];
+const HP_CATS=['Sender & Recipient','Message Information','Email & Domain','Server & Infrastructure','Encoding & Encryption','Random Generation','Date & Time','Negative Text & Brand','Other'];
+const HP_PH=[
+ ['Sender & Recipient','[First_Part]','Email first part before @'],
+ ['Sender & Recipient','[fromName]','Sender name'],
+ ['Sender & Recipient','[fromEmail]','Sender email address'],
+ ['Sender & Recipient','[To]','Receiver email address'],
+ ['Sender & Recipient','[fname]','First name, defaulting to the first email part'],
+ ['Sender & Recipient','[FirstPart_ucw]','First email part in uppercase'],
+ ['Sender & Recipient','[ToRandomCase]','Receiver email with randomized uppercase/lowercase'],
+ ['Message Information','[Date]','Sending date'],
+ ['Message Information','[Subject]','Message subject'],
+ ['Message Information','[mid]','Current message ID'],
+ ['Message Information','[returnPath]','Address accepting automatic responses'],
+ ['Message Information','[replyTo]','Address accepting replies'],
+ ['Email & Domain','[eml_dom]','Receiver email domain'],
+ ['Email & Domain','[dom]','Domain of selected IPs'],
+ ['Email & Domain','[mdom]','Main domain of selected IPs'],
+ ['Email & Domain','[pdom]','Prefix domain of selected IPs'],
+ ['Email & Domain','[ldom]','Domain selected from the domain-list textarea'],
+ ['Server & Infrastructure','[server]','Server name'],
+ ['Server & Infrastructure','[ip]','Outgoing IP'],
+ ['Server & Infrastructure','[iprv]','Outgoing IP reverse DNS'],
+ ['Encoding & Encryption','[charset]','Character encoding'],
+ ['Encoding & Encryption','[encodingH]','Encoding header'],
+ ['Encoding & Encryption','[First_Part_b64]','First email part encoded in Base64'],
+ ['Encoding & Encryption','[To64]','Receiver email encoded in Base64'],
+ ['Encoding & Encryption','[md5Eml]','Email address encrypted with MD5'],
+ ['Encoding & Encryption','[idn]','Email ID encrypted with random'],
+ ['Encoding & Encryption','[idu]','Email ID encrypted with Base64'],
+ ['Encoding & Encryption','[5_10_NaA_b64]','Alphanumeric, length 5–10, Base64 encoded'],
+ ['Random Generation','[uuid]','Random integer between 100 and 500000'],
+ ['Random Generation','[rand]','Random string with length between 10 and 15'],
+ ['Random Generation','[5_10_NaA]','Alphanumeric, length 5–10; digits, lowercase and uppercase'],
+ ['Random Generation','[5_10,A_F]{2,3}','Random alphanumeric using numbers 5–10 and letters A–F, length 2–3'],
+ ['Random Generation','[A_F]{2,3}','Random letters A–F, length 2–3'],
+ ['Random Generation','[_5_10_Aa]','Unique random alphanumeric, length 5–10'],
+ ['Random Generation','[10_250]','Unique random integer between 10 and 250'],
+ ['Random Generation','[arabic_latin_chinese]{5,10}','Random characters from selected language groups, length 5–10. Groups: latin, cyrillic, arabic, devanagari, chinese, hiragana, thai, armenian, georgian, greek, emoji, hebrew, amazigh, katakana, hangul, bengali, tamil, ethiopic'],
+ ['Date & Time','[daterdn_Y.m.d-H.M.S]','Dynamic date/time formatting'],
+ ['Negative Text & Brand','[negtf]','Negative text of defined ID'],
+ ['Negative Text & Brand','[negtfid]','Negative ID'],
+ ['Negative Text & Brand','[negtf2]','Negative text of defined ID2'],
+ ['Negative Text & Brand','[negtfid2]','Negative ID2'],
+ ['Negative Text & Brand','[brand]','Brand address detail']
+];
+let hpRules=null,hpEditIndex=null,hpEditParse=null,hpPlain='';
+
+function hpOwn(o,k){return Object.prototype.hasOwnProperty.call(o,k)}
 function hpEsc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function hpCharType(s){
   if(!s||!/^[A-Za-z0-9]+$/.test(s))return null;
   return (/[A-Z]/.test(s)?'A':'')+(/[a-z]/.test(s)?'a':'')+(/[0-9]/.test(s)?'N':'');
 }
+function hpTagInfo(s){
+  const type=hpCharType(s);if(!type)return null;
+  const n=s.length;
+  return{src:s,len:n,upper:/[A-Z]/.test(s),lower:/[a-z]/.test(s),nums:/[0-9]/.test(s),type,tag:`[${n}_${n}_${type}]`};
+}
 function hpParseFrom(v){
-  const m=/^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.exec(v);
-  if(m)return{email:m[2]};
-  if(/^[^\s<>"@]+@[^\s<>"@]+$/.test(v))return{bare:true,email:v};
+  if(/^(.*?)\s*<([^<>\s]+@[^<>\s]+)>\s*$/.test(v))return{bare:false};
+  if(/^[^\s<>"@]+@[^\s<>"@]+$/.test(v))return{bare:true};
   return{review:'From value is neither "Name <email>" nor a plain email address.'};
 }
-function hpParseMessageId(v){
-  const m=/<([^<>@\s]+)@([^<>\s]+)>/.exec(v);
-  if(!m)return{review:'Message-ID does not contain a <local@domain> value.'};
-  const local=m[1],type=hpCharType(local);
-  if(!type)return{review:`The dynamic part "${local}" contains characters other than letters and numbers, so its type cannot be classified.`};
-  const n=local.length,tag=`[${n}_${n}_${type}]`;
-  return{
-    tag,
-    value:v.slice(0,m.index)+`<${tag}@${m[2]}>`+v.slice(m.index+m[0].length),
-    analysis:{local,len:n,upper:/[A-Z]/.test(local),lower:/[a-z]/.test(local),nums:/[0-9]/.test(local),type,tag}
-  };
+function hpLocate(target,v){
+  if(target==='angle-local'){
+    const m=/<([^<>@\s]+)@([^<>\s]+)>/.exec(v);
+    if(!m)return{review:'No <local@domain> value was found.'};
+    return{start:m.index+1,end:m.index+1+m[1].length,text:m[1]};
+  }
+  if(target==='email-local'){
+    const m=/^([^<>\s@]+)@([^<>\s@]+)$/.exec(v);
+    if(!m)return{review:'The value is not a plain email address.'};
+    return{start:0,end:m[1].length,text:m[1]};
+  }
+  if(target==='display-name'){
+    const m=/^(.*?)\s*<[^<>\s]+@[^<>\s]+>\s*$/.exec(v);
+    if(!m||!m[1].trim())return{review:'No display name was found before <email>.'};
+    return{start:0,end:m[1].length,text:m[1].replace(/^"(.*)"$/,'$1').trim()};
+  }
+  return{review:'Unknown partial target.'};
 }
-function hpUnfold(b){
-  const first=b.lines[0],rest=first.slice(first.indexOf(':')+1);
-  const ws=/^[ \t]*/.exec(rest)[0];
-  const parts=[rest.trim(),...b.lines.slice(1).map(l=>l.trim())].filter(Boolean);
-  return{value:parts.join(' '),ws};
+// Applies one rule to one unfolded header value. Returns {ok,newValue,info} or {ok:false,reason}.
+function hpApply(rule,value){
+  if(rule.mode==='full'){
+    if(rule.source==='auto'){
+      const info=hpTagInfo(value.trim());
+      if(!info)return{ok:false,reason:'The value is empty or contains characters other than letters and numbers, so an automatic tag cannot be chosen.'};
+      return{ok:true,newValue:info.tag,info};
+    }
+    if(rule.parse==='from'){
+      const f=hpParseFrom(value);
+      if(f.review)return{ok:false,reason:f.review};
+      return{ok:true,newValue:f.bare?'[fromEmail]':rule.value};
+    }
+    return{ok:true,newValue:rule.value};
+  }
+  const loc=hpLocate(rule.target,value);
+  if(loc.review)return{ok:false,reason:loc.review};
+  let rep=rule.value,info=null;
+  if(rule.source==='auto'){
+    info=hpTagInfo(loc.text);
+    if(!info)return{ok:false,reason:`The targeted part "${loc.text}" contains characters other than letters and numbers, so an automatic tag cannot be chosen.`};
+    rep=info.tag;
+  }
+  if(rule.target!=='display-name'&&/[<>@\s]/.test(rep))return{ok:false,reason:'The replacement contains <, >, @ or a space, which would break the address structure.'};
+  if(/[<>]/.test(rep))return{ok:false,reason:'The replacement contains < or >.'};
+  return{ok:true,newValue:value.slice(0,loc.start)+rep+value.slice(loc.end),info};
+}
+function hpValidateRule(r){
+  if(!r||typeof r!=='object')return 'Rule is not an object.';
+  const h=typeof r.header==='string'?r.header.trim():'';
+  if(!h)return 'Header name is required.';
+  if(!/^[!-9;-~]+$/.test(h))return `"${h}" is not a valid header name (no spaces or colons).`;
+  if(r.mode!=='full'&&r.mode!=='partial')return 'Mode must be Full Value or Partial Value.';
+  if(!['placeholder','custom','auto'].includes(r.source))return 'Replacement type is invalid.';
+  if(r.mode==='partial'&&!(typeof r.target==='string'&&hpOwn(HP_TARGETS,r.target)))return 'Partial rules need a target, such as the local part inside <local@domain>.';
+  if(r.source!=='auto'&&(typeof r.value!=='string'||!r.value.trim()))return 'Replacement value is empty.';
+  if(r.enabled!==undefined&&typeof r.enabled!=='boolean')return 'Enabled must be true or false.';
+  if(r.parse!==undefined&&r.parse!=='from')return 'Unknown parse option.';
+  return null;
+}
+function hpClean(r){
+  const c={header:r.header.trim(),mode:r.mode,source:r.source,value:r.source==='auto'?'':String(r.value).trim(),enabled:r.enabled!==false};
+  if(r.mode==='partial')c.target=r.target;
+  if(r.parse==='from')c.parse='from';
+  return c;
+}
+function hpDefaults(){return HP_DEFAULTS.map(x=>({...x}))}
+function hpLoad(){
+  try{
+    const raw=localStorage.getItem(HP_STORE);
+    if(!raw)return{rules:hpDefaults(),note:''};
+    const d=JSON.parse(raw),list=d&&Array.isArray(d.rules)?d.rules:null;
+    if(!list)throw new Error('no rules');
+    const rules=[],seen=new Set();let skipped=0;
+    for(const r of list){
+      if(hpValidateRule(r)){skipped++;continue}
+      const c=hpClean(r),k=c.header.toLowerCase();
+      if(seen.has(k)){skipped++;continue}
+      seen.add(k);rules.push(c);
+    }
+    return{rules,note:skipped?`${skipped} saved rule(s) were invalid and were skipped.`:''};
+  }catch(e){
+    return{rules:hpDefaults(),note:'Saved rules could not be read, so the default rules were loaded.'};
+  }
+}
+function hpSave(){
+  try{
+    localStorage.setItem(HP_STORE,JSON.stringify({version:1,rules:hpRules}));
+    const s=el('hp-saved');if(s)s.textContent='Custom rules saved in this browser at '+new Date().toLocaleTimeString();
+  }catch(e){toast('Rules could not be saved in this browser.','err')}
+}
+function hpDup(header,skip){
+  return hpRules.some((r,i)=>i!==skip&&r.header.trim().toLowerCase()===header.trim().toLowerCase());
+}
+function hpLabel(r){return `${r.header} · ${r.mode==='full'?'Full value':'Partial: '+HP_TARGETS[r.target]}`}
+function hpSummary(r){
+  const what=r.source==='auto'?'automatic random tag':r.value;
+  if(r.mode==='full')return `Full value → ${what}`;
+  return `${HP_TARGETS[r.target]} → ${what}`;
 }
 function hpRun(input){
   if(!input.trim())return{error:'Paste the original headers first.'};
@@ -320,82 +459,253 @@ function hpRun(input){
     const m=/^([!-9;-~]+):/.exec(line);
     blocks.push({lines:[line],name:m?m[1]:null});
   }
-  const out=[],replacements=[],review=[],analyses=[];
+  const byName=new Map();
+  hpRules.forEach((r,i)=>byName.set(r.header.toLowerCase(),i));
+  const ruleStats=hpRules.map(()=>({matched:0,applied:0}));
+  const out=[],reps=[],attention=[],infos=[];
   let total=0,personalized=0,tags=0;
   for(const b of blocks){
-    const key=b.name?b.name.toLowerCase():null;
-    if(!key){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    const keep=()=>b.lines.forEach(l=>out.push({t:l,hl:false}));
+    if(!b.name){keep();continue}
     total++;
-    const isFixed=Object.prototype.hasOwnProperty.call(HP_FIXED,key);
-    if(!isFixed&&key!=='from'&&key!=='message-id'){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    const idx=byName.get(b.name.toLowerCase());
+    if(idx===undefined){keep();continue}
+    const rule=hpRules[idx];
+    ruleStats[idx].matched++;
+    if(!rule.enabled){keep();continue}
     const{value,ws}=hpUnfold(b);
-    let newValue=null;
-    if(isFixed)newValue=HP_FIXED[key];
-    else if(key==='from'){
-      const f=hpParseFrom(value);
-      if(f.review)review.push({field:b.name,original:value,reason:f.review});
-      else newValue=f.bare?'[fromEmail]':'[fromName] <[fromEmail]>';
-    }else{
-      const mi=hpParseMessageId(value);
-      if(mi.review)review.push({field:b.name,original:value,reason:mi.review});
-      else{newValue=mi.value;tags++;analyses.push(mi.analysis)}
-    }
-    if(newValue===null){b.lines.forEach(l=>out.push({t:l,hl:false}));continue}
+    const r=hpApply(rule,value);
+    if(!r.ok){attention.push({field:b.name,rule:idx,original:value,reason:r.reason});keep();continue}
     personalized++;
-    out.push({t:`${b.name}:${ws}${newValue}`,hl:true});
-    replacements.push({field:b.name,original:value,value:newValue});
+    ruleStats[idx].applied++;
+    if(r.info){tags++;infos.push(r.info)}
+    out.push({t:`${b.name}:${ws}${r.newValue}`,hl:true});
+    reps.push({field:b.name,original:value,value:r.newValue,rule:idx});
   }
   return{
     plain:out.map(x=>x.t).join(eol),
     html:out.map(x=>x.hl?HP_MARK+hpEsc(x.t)+'</mark>':hpEsc(x.t)).join('\n'),
-    replacements,review,analyses,
-    stats:{'Headers detected':total,'Personalized':personalized,'Random tags generated':tags,'Preserved unchanged':total-personalized,'Needs review':review.length}
+    reps,attention,infos,ruleStats,
+    stats:{'Headers detected':total,'Personalized':personalized,'Random tags generated':tags,'Preserved unchanged':total-personalized,'Needs attention':attention.length}
   };
 }
-function hpClear(){
-  el('hp-in').value='';hpPlain='';
+function hpUnfold(b){
+  const first=b.lines[0],rest=first.slice(first.indexOf(':')+1);
+  const ws=/^[ \t]*/.exec(rest)[0];
+  const parts=[rest.trim(),...b.lines.slice(1).map(l=>l.trim())].filter(Boolean);
+  return{value:parts.join(' '),ws};
+}
+function hpClearOutput(){
   el('hp-out').innerHTML='';el('hp-stats').innerHTML='';
-  el('hp-rep').innerHTML='';el('hp-tag').innerHTML='';el('hp-rev').innerHTML='';
-  setMsg('');
+  el('hp-rep').innerHTML='';el('hp-tag').innerHTML='';el('hp-report').innerHTML='';
+  hpPlain='';
 }
 function hpRunUI(){
   const r=hpRun(el('hp-in').value);
-  if(r.error){
-    setMsg(r.error,'err');toast(r.error,'err');
-    hpPlain='';el('hp-out').innerHTML='';el('hp-stats').innerHTML='';
-    el('hp-rep').innerHTML='';el('hp-tag').innerHTML='';el('hp-rev').innerHTML='';
-    return;
-  }
+  if(r.error){setMsg(r.error,'err');toast(r.error,'err');hpClearOutput();return}
   hpPlain=r.plain;
   el('hp-out').innerHTML=r.html;
-  el('hp-stats').innerHTML=Object.entries(r.stats).map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
-  el('hp-rep').innerHTML=r.replacements.length
-    ?r.replacements.map(x=>`<div style="margin-bottom:6px"><b>${hpEsc(x.field)}</b>: <code>${hpEsc(x.original)}</code> → <code>${hpEsc(x.value)}</code></div>`).join('')
+  el('hp-stats').innerHTML=Object.entries(r.stats).map(([k,v])=>`<div><dt>${hpEsc(k)}</dt><dd>${v}</dd></div>`).join('');
+  el('hp-rep').innerHTML=r.reps.length
+    ?r.reps.map(x=>`<div style="margin-bottom:8px"><b>${hpEsc(x.field)}</b> <span class="hint">· ${hpEsc(hpLabel(hpRules[x.rule]))}</span><br><code>${hpEsc(x.original)}</code> → <code>${hpEsc(x.value)}</code></div>`).join('')
     :'No headers were personalized.';
-  el('hp-tag').innerHTML=r.analyses.length
-    ?r.analyses.map(a=>`<dl class="stats" style="margin-bottom:8px"><div><dt>Dynamic part</dt><dd>${hpEsc(a.local)}</dd></div><div><dt>Length</dt><dd>${a.len}</dd></div><div><dt>Uppercase</dt><dd>${a.upper?'Yes':'No'}</dd></div><div><dt>Lowercase</dt><dd>${a.lower?'Yes':'No'}</dd></div><div><dt>Numbers</dt><dd>${a.nums?'Yes':'No'}</dd></div><div><dt>Type</dt><dd>${a.type}</dd></div><div><dt>Tag</dt><dd>${hpEsc(a.tag)}</dd></div></dl>`).join('')
-    :'No Message-ID was found to analyze.';
-  el('hp-rev').innerHTML=r.review.length
-    ?r.review.map(x=>`<div style="margin-bottom:8px"><b>${hpEsc(x.field)}</b>: ${hpEsc(x.reason)}<br><code>${hpEsc(x.original)}</code></div>`).join('')
-    :'Nothing needs review.';
-  if(r.review.length)setMsg(`${r.review.length} header(s) could not be confidently classified and were left unchanged. See Needs review.`,'warn');
+  el('hp-tag').innerHTML=r.infos.length
+    ?r.infos.map(a=>`<dl class="stats" style="margin-bottom:8px"><div><dt>Dynamic value</dt><dd>${hpEsc(a.src)}</dd></div><div><dt>Length</dt><dd>${a.len}</dd></div><div><dt>Uppercase</dt><dd>${a.upper?'Yes':'No'}</dd></div><div><dt>Lowercase</dt><dd>${a.lower?'Yes':'No'}</dd></div><div><dt>Numbers</dt><dd>${a.nums?'Yes':'No'}</dd></div><div><dt>Type</dt><dd>${a.type}</dd></div><div><dt>Tag</dt><dd>${hpEsc(a.tag)}</dd></div></dl>`).join('')
+    :'No automatic random tags were generated.';
+  const grp=(title,items,empty)=>`<div style="margin-bottom:10px"><b>${title}</b>${items.length?'<ul style="margin:4px 0 0;padding-left:20px">'+items.map(x=>`<li>${x}</li>`).join('')+'</ul>':`<div class="hint">${empty}</div>`}</div>`;
+  const idxs=hpRules.map((rule,i)=>i);
+  const applied=idxs.filter(i=>r.ruleStats[i].applied>0).map(i=>`${hpEsc(hpLabel(hpRules[i]))}: ${r.ruleStats[i].applied} replacement(s)`);
+  const disabled=idxs.filter(i=>!hpRules[i].enabled).map(i=>`${hpEsc(hpLabel(hpRules[i]))}: ${r.ruleStats[i].matched} matching header(s)`);
+  const nomatch=idxs.filter(i=>hpRules[i].enabled&&r.ruleStats[i].matched===0).map(i=>hpEsc(hpLabel(hpRules[i])));
+  const attn=r.attention.map(a=>`${hpEsc(a.field)} (${hpEsc(hpLabel(hpRules[a.rule]))}): ${hpEsc(a.reason)}<br><code>${hpEsc(a.original)}</code>`);
+  el('hp-report').innerHTML=grp('Successfully applied',applied,'No rules were applied.')+grp('Disabled rules',disabled,'No disabled rules.')+grp('No matching headers',nomatch,'Every enabled rule matched a header.')+grp('Needs attention',attn,'Nothing needs attention.');
+  if(r.attention.length)setMsg(`${r.attention.length} header(s) need attention and were left unchanged. See Rule report.`,'warn');
   else setMsg('');
   toast('Headers personalized');
 }
+function hpRenderRules(){
+  const enabled=hpRules.filter(r=>r.enabled).length;
+  el('hp-count').textContent=hpRules.length?`${hpRules.length} rules · ${enabled} enabled`:'No rules';
+  const q=el('hp-q').value.trim().toLowerCase();
+  const rows=hpRules.map((r,i)=>({r,i})).filter(({r})=>!q||(r.header+' '+hpSummary(r)).toLowerCase().includes(q));
+  el('hp-list').innerHTML=rows.length
+    ?rows.map(({r,i})=>`<div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;background:var(--panel)">
+        <div style="min-width:0;flex:1 1 260px"><b>${hpEsc(r.header)}</b> <span class="hint">${r.enabled?'':'(disabled)'}</span><div class="hint">${hpEsc(hpSummary(r))}</div></div>
+        <div class="row" style="margin:0"><button data-act="toggle" data-i="${i}">${r.enabled?'Disable':'Enable'}</button><button data-act="edit" data-i="${i}">Edit</button><button data-act="del" data-i="${i}">Delete</button></div></div>`).join('')
+    :'<p class="hint">No rules match your search.</p>';
+}
+function hpPhList(){
+  const q=el('ed-ph-q').value.trim().toLowerCase();
+  let html='';
+  for(const cat of HP_CATS){
+    const items=HP_PH.filter(p=>p[0]===cat&&(!q||(p[1]+' '+p[2]).toLowerCase().includes(q)));
+    if(!items.length)continue;
+    html+=`<optgroup label="${hpEsc(cat)}">`+items.map(p=>`<option value="${hpEsc(p[1])}">${hpEsc(p[1])} — ${hpEsc(p[2])}</option>`).join('')+'</optgroup>';
+  }
+  el('ed-ph').innerHTML=html||'<option disabled>No matching placeholders</option>';
+}
+function hpEdSync(){
+  const partial=el('ed-mode').value==='partial',auto=el('ed-source').value==='auto';
+  el('ed-target-wrap').hidden=!partial;
+  el('ed-value-wrap').hidden=auto;
+  el('ed-ph-wrap').hidden=auto;
+  let hint='';
+  if(auto)hint='Automatic random tag: the tag is built from the length and character types of the original value. No random value is generated here.';
+  else if(partial)hint=`Only the chosen part is replaced: ${HP_TARGETS[el('ed-target').value]}. Everything else stays as it is.`;
+  else hint='Full value: the whole header value is replaced.';
+  el('ed-hint').textContent=hint;
+}
+function hpShowEditor(i){
+  hpEditIndex=i==null?null:i;
+  const r=i==null?{header:'',mode:'full',target:'angle-local',source:'placeholder',value:'',enabled:true}:hpRules[i];
+  hpEditParse=r.parse||null;
+  el('ed-header').value=r.header;
+  el('ed-mode').value=r.mode;
+  el('ed-target').value=r.target||'angle-local';
+  el('ed-source').value=r.source;
+  el('ed-value').value=r.value||'';
+  el('ed-enabled').checked=r.enabled;
+  el('ed-ph-q').value='';
+  el('ed-err').textContent='';
+  hpPhList();
+  hpEdSync();
+  el('hp-editor').hidden=false;
+  el('ed-header').focus();
+}
+function hpEdSave(){
+  const header=el('ed-header').value.trim(),mode=el('ed-mode').value,source=el('ed-source').value;
+  const rule={header,mode,source,value:source==='auto'?'':el('ed-value').value.trim(),enabled:el('ed-enabled').checked};
+  if(mode==='partial')rule.target=el('ed-target').value;
+  if(hpEditParse)rule.parse=hpEditParse;
+  const err=hpValidateRule(rule)||(hpDup(header,hpEditIndex)?`A rule for "${header}" already exists. Edit that rule instead.`:null);
+  if(err){el('ed-err').textContent=err;return}
+  const clean=hpClean(rule);
+  if(hpEditIndex==null)hpRules.push(clean);else hpRules[hpEditIndex]=clean;
+  hpSave();
+  el('hp-editor').hidden=true;
+  hpRenderRules();
+  toast('Rule saved');
+}
+function hpExport(){
+  const data={app:'mailers-toolkit-header-rules',version:1,exportedAt:new Date().toISOString(),rules:hpRules.map(hpClean)};
+  const name='mailers-header-rules.json';
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+  a.download=name;document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast('Rules exported');
+}
+function hpImportText(text){
+  const io=(msg,ok)=>{const m=el('hp-io-msg');m.textContent=msg;m.style.color=ok?'var(--muted)':'var(--danger)'};
+  let d;
+  try{d=JSON.parse(text)}catch(e){return io('The file is not valid JSON. Nothing was changed.',false)}
+  const list=Array.isArray(d)?d:(d&&Array.isArray(d.rules)?d.rules:null);
+  if(!list)return io('The file has no "rules" list. Nothing was changed.',false);
+  if(!list.length)return io('The file contains no rules. Nothing was changed.',false);
+  const errs=[],clean=[],seen=new Set();
+  list.forEach((r,i)=>{
+    const e=hpValidateRule(r);
+    if(e){errs.push(`Rule ${i+1}: ${e}`);return}
+    const c=hpClean(r),k=c.header.toLowerCase();
+    if(seen.has(k)){errs.push(`Rule ${i+1}: duplicate header "${c.header}".`);return}
+    seen.add(k);clean.push(c);
+  });
+  if(errs.length)return io(`Import cancelled. ${errs.length} problem(s): ${errs.join(' ')}`,false);
+  if(!confirm(`Replace your current ${hpRules.length} rule(s) with ${clean.length} imported rule(s)?`))return io('Import cancelled.',true);
+  hpRules=clean;hpSave();hpRenderRules();el('hp-editor').hidden=true;
+  io(`Imported ${clean.length} rule(s).`,true);
+}
+function hpClear(){
+  el('hp-in').value='';hpClearOutput();setMsg('');
+}
 function mountHeaders(root){
+  if(!hpRules){
+    const l=hpLoad();hpRules=l.rules;
+    if(l.note)setTimeout(()=>toast(l.note,'err'),0);
+  }
   root.innerHTML=`
-  <header class="head"><h1>Raw Email Header Personalizer</h1><p>Paste Gmail Show original headers and replace the source-specific values with mailer tags. All other headers are kept exactly as provided.</p>
-    <details class="how"><summary>How to use</summary><ol><li>Paste the full header block from Gmail Show original.</li><li>Click Personalize Headers.</li><li>Check the replacements and the Message-ID tag analysis.</li><li>Review anything under Needs review, then click Copy Result.</li></ol></details></header>
-  <section class="io"><label><span>Original headers</span><textarea id="hp-in" spellcheck="false" style="min-height:220px" placeholder="Paste the raw headers here, for example Date:, From:, Message-ID:, Subject:, To:"></textarea></label>
+  <header class="head"><h1>Raw Email Header Personalizer</h1><p>Paste Gmail Show original headers and replace source-specific values with mailer placeholders. Headers without a rule are kept exactly as provided.</p>
+    <details class="how"><summary>How to use</summary><ol><li>Open Replacement Rules to review, add, or disable rules.</li><li>Paste the full header block from Gmail Show original.</li><li>Click Personalize Headers.</li><li>Review the Rule report, then click Copy Result.</li></ol></details></header>
+  <details id="hp-rules-box" style="margin-bottom:18px">
+    <summary>Replacement Rules <span id="hp-count" class="hint"></span></summary>
+    <div style="margin-top:10px">
+      <div class="row"><span id="hp-saved" class="hint"></span></div>
+      <div class="row">
+        <input type="search" id="hp-q" placeholder="Search rules" aria-label="Search rules" style="width:220px">
+        <button class="primary" id="hp-add">Add Rule</button>
+        <button id="hp-export">Export Rules</button>
+        <button id="hp-import">Import Rules</button>
+        <button id="hp-reset-rules">Reset Default Rules</button>
+        <input type="file" id="hp-import-file" accept=".json,application/json" hidden>
+      </div>
+      <div id="hp-io-msg" class="hint" role="status"></div>
+      <div id="hp-editor" hidden style="border:1px solid var(--line);border-radius:8px;padding:12px;margin:10px 0;background:var(--panel)">
+        <div class="controls" style="margin:0 0 10px">
+          <label>Header name <input type="text" id="ed-header" placeholder="e.g. Return-Path" style="width:220px"></label>
+          <label>Mode <select id="ed-mode"><option value="full">Full Value</option><option value="partial">Partial Value</option></select></label>
+          <label id="ed-target-wrap" hidden>Target <select id="ed-target"><option value="angle-local">Local part inside &lt;local@domain&gt;</option><option value="email-local">Local part of a bare email</option><option value="display-name">Display name before &lt;email&gt;</option></select></label>
+          <label>Replacement type <select id="ed-source"><option value="placeholder">Existing placeholder</option><option value="custom">Custom text</option><option value="auto">Automatic random tag</option></select></label>
+          <label><input type="checkbox" id="ed-enabled" checked> Enabled</label>
+        </div>
+        <div id="ed-ph-wrap">
+          <label style="display:block;margin-bottom:6px">Search placeholders <input type="search" id="ed-ph-q" placeholder="Name or description" style="width:100%"></label>
+          <select id="ed-ph" size="8" style="width:100%" aria-label="Placeholder library"></select>
+        </div>
+        <label id="ed-value-wrap" style="display:block;margin-top:10px">Replacement value <input type="text" id="ed-value" style="width:100%" placeholder="Pick a placeholder above or type custom text"></label>
+        <p id="ed-hint" class="hint"></p>
+        <div id="ed-err" role="alert" style="color:var(--danger)"></div>
+        <div class="row"><button class="primary" id="ed-save">Save rule</button><button id="ed-cancel">Cancel</button></div>
+      </div>
+      <div id="hp-list"></div>
+    </div>
+  </details>
+  <section class="io"><label><span>Original headers</span><div class="drop"><textarea id="hp-in" spellcheck="false" style="min-height:220px" placeholder="Paste the raw headers here, for example Date:, From:, Message-ID:, Subject:, To:"></textarea></div></label>
     <div class="row"><button id="hp-paste">Paste</button><button id="hp-clear">Clear</button></div></section>
   <div class="row actions"><button class="primary" id="hp-run">Personalize Headers</button><button id="hp-copy">Copy Result</button><button id="hp-clear2">Clear</button></div>
   <div id="msg" role="status"></div>
   <dl class="stats" id="hp-stats"></dl>
   <section class="out"><span style="display:block;font-size:14px;color:var(--muted);margin:12px 0 4px">Personalized output (replaced values highlighted)</span>
     <pre id="hp-out" style="border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:12px;white-space:pre-wrap;word-break:break-all;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:160px;margin:0"></pre></section>
-  <details open style="margin-top:14px"><summary>Replacements</summary><div id="hp-rep" class="hint" style="margin-top:8px"></div></details>
-  <details open style="margin-top:10px"><summary>Message-ID tag analysis</summary><div id="hp-tag" class="hint" style="margin-top:8px"></div></details>
-  <details style="margin-top:10px"><summary>Needs review</summary><div id="hp-rev" class="hint" style="margin-top:8px"></div></details>`;
+  <details style="margin-top:14px"><summary>Replacements</summary><div id="hp-rep" class="hint" style="margin-top:8px"></div></details>
+  <details style="margin-top:10px"><summary>Random tag analysis</summary><div id="hp-tag" class="hint" style="margin-top:8px"></div></details>
+  <details open style="margin-top:10px"><summary>Rule report</summary><div id="hp-report" class="hint" style="margin-top:8px"></div></details>`;
+  el('hp-count').textContent='';
+  hpRenderRules();
+  el('hp-saved').textContent='';
+  el('hp-q').oninput=hpRenderRules;
+  el('hp-add').onclick=()=>hpShowEditor(null);
+  el('hp-export').onclick=hpExport;
+  el('hp-import').onclick=()=>el('hp-import-file').click();
+  el('hp-import-file').onchange=e=>{
+    const f=e.target.files[0];e.target.value='';if(!f)return;
+    const rd=new FileReader();
+    rd.onload=()=>hpImportText(String(rd.result));
+    rd.onerror=()=>{el('hp-io-msg').textContent='Could not read that file.';el('hp-io-msg').style.color='var(--danger)'};
+    rd.readAsText(f);
+  };
+  el('hp-reset-rules').onclick=()=>{
+    if(!confirm('Reset all replacement rules to the five defaults? Your custom rules will be removed.'))return;
+    hpRules=hpDefaults();hpSave();hpRenderRules();el('hp-editor').hidden=true;
+    el('hp-io-msg').textContent='Default rules restored.';el('hp-io-msg').style.color='var(--muted)';
+  };
+  el('hp-list').onclick=e=>{
+    const b=e.target.closest('button[data-act]');if(!b)return;
+    const i=+b.dataset.i,act=b.dataset.act;
+    if(act==='edit')hpShowEditor(i);
+    else if(act==='toggle'){hpRules[i].enabled=!hpRules[i].enabled;hpSave();hpRenderRules()}
+    else if(act==='del'){
+      if(!confirm(`Delete the rule for "${hpRules[i].header}"?`))return;
+      hpRules.splice(i,1);hpSave();hpRenderRules();
+      if(hpEditIndex===i)el('hp-editor').hidden=true;
+    }
+  };
+  el('ed-mode').onchange=hpEdSync;
+  el('ed-source').onchange=hpEdSync;
+  el('ed-target').onchange=hpEdSync;
+  el('ed-ph-q').oninput=hpPhList;
+  el('ed-ph').onchange=e=>{el('ed-value').value=e.target.value;el('ed-source').value='placeholder';hpEdSync()};
+  el('ed-save').onclick=hpEdSave;
+  el('ed-cancel').onclick=()=>{el('hp-editor').hidden=true};
   el('hp-run').onclick=hpRunUI;
   el('hp-clear').onclick=hpClear;
   el('hp-clear2').onclick=hpClear;
