@@ -274,7 +274,9 @@ const TOOLS=[
  desc:'Work out the exact delay between messages to spread a send evenly over a period.'},
 
 {id:'headers',group:'Email & HTML',name:'Raw Email Header Personalizer',mount:mountHeaders,
- desc:'Replace source-specific Gmail header values with mailer tags, leaving all other headers untouched.'}
+ desc:'Replace source-specific Gmail header values with mailer tags, leaving all other headers untouched.'},
+{id:'seedcsv',group:'Mailbox Tools',name:'Seed CSV Exporter',mount:mountSeedCsv,
+ desc:'Convert a Google Sheets HTML export into Warmup App CSV files, one per RDP user.'}
 ];
 
 /* ---------- raw email header personalizer ---------- */
@@ -856,6 +858,263 @@ function mountSpeed(root){
   el('sp-reset').onclick=()=>{setSpeedInputs(SPEED_DEFAULTS);calcSpeed()};
   el('sp-copy').onclick=()=>copyText(el('sp-copy').dataset.value||'');
   calcSpeed();
+}
+
+/* ---------- seed csv exporter ---------- */
+const SC_HEADER='email,password,email_recovery,otp,proxy,backup_codes,';
+const SC_EMAIL=/^[^\s@]+@[^\s@]+$/;
+let scState=null;
+
+function scNorm(s){return String(s).replace(/\s+/g,' ').trim().toLowerCase()}
+function scCellText(td){
+  const c=td.cloneNode(true);
+  c.querySelectorAll('br').forEach(b=>b.replaceWith('\n'));
+  return c.textContent;
+}
+// Builds a dense grid from an HTML table, expanding rowspan and colspan.
+// A merged cell's value is copied into every position it covers, so each mailbox row carries its RDP user.
+function scBuildGrid(table){
+  const grid=[],occ=new Set();
+  [...table.rows].forEach((tr,r)=>{
+    grid[r]=grid[r]||[];
+    let c=0;
+    for(const cell of tr.cells){
+      while(occ.has(r+','+c))c++;
+      const rs=Math.max(1,parseInt(cell.getAttribute('rowspan')||'1',10)||1);
+      const cs=Math.max(1,parseInt(cell.getAttribute('colspan')||'1',10)||1);
+      const val=scCellText(cell);
+      for(let i=0;i<rs;i++)for(let j=0;j<cs;j++){
+        const rr=r+i,cc=c+j;
+        grid[rr]=grid[rr]||[];
+        grid[rr][cc]=val;
+        occ.add(rr+','+cc);
+      }
+      c+=cs;
+    }
+  });
+  const width=Math.max(0,...grid.map(row=>row.length));
+  return grid.map(row=>{const out=[];for(let i=0;i<width;i++)out.push(row[i]??'');return out});
+}
+// Finds the first row that contains both an RDP and an Email header. Headers are matched by normalized text.
+function scFindHeader(grid){
+  for(let r=0;r<grid.length;r++){
+    const norm=grid[r].map(scNorm);
+    const rdp=norm.indexOf('rdp'),email=norm.indexOf('email');
+    if(rdp>=0&&email>=0){
+      const at=h=>norm.indexOf(h);
+      return{row:r,cols:{rdp,email,newPassword:at('new password'),password:at('password'),newRecovery:at('new recovery'),recovery:at('recovery'),newOtp:at('new otp'),otp:at('otp'),newBackup:at('new backup codes'),backup:at('backup codes'),proxy:at('proxy')}};
+    }
+  }
+  return null;
+}
+// Extracts mailbox records, grouped by RDP user in order of first appearance.
+function scExtract(grid,h){
+  const c=h.cols,warnings=[],skipped={noRdp:0,invalidEmail:0};
+  if(c.newPassword<0&&c.password<0)warnings.push('No Password column was found.');
+  if(c.newRecovery<0&&c.recovery<0)warnings.push('No Recovery column was found.');
+  if(c.newOtp<0&&c.otp<0)warnings.push('No Otp column was found.');
+  if(c.newBackup<0&&c.backup<0)warnings.push('No Backup codes column was found.');
+  if(c.proxy<0)warnings.push('No Proxy column was found, so the proxy field is empty for every mailbox.');
+  // New value wins when it is non-blank; otherwise the original value is used; blank cells count as empty.
+  const pick=(row,newI,origI)=>{
+    if(newI>=0&&row[newI].trim()!=='')return row[newI];
+    if(origI>=0&&row[origI].trim()!=='')return row[origI];
+    return '';
+  };
+  const users=new Map(),seen=new Map();
+  let mailboxes=0;
+  for(let r=h.row+1;r<grid.length;r++){
+    const row=grid[r];
+    const email=row[c.email].trim();
+    if(email==='')continue;                       // blank row
+    if(scNorm(email)==='email')continue;          // repeated header row
+    const rdp=row[c.rdp].trim();
+    if(rdp===''){skipped.noRdp++;continue}
+    if(!SC_EMAIL.test(email)){skipped.invalidEmail++;continue}
+    const rec={
+      email,
+      password:pick(row,c.newPassword,c.password),
+      recovery:pick(row,c.newRecovery,c.recovery),
+      otp:pick(row,c.newOtp,c.otp),
+      proxy:c.proxy>=0&&row[c.proxy].trim()!==''?row[c.proxy]:'',
+      backup:pick(row,c.newBackup,c.backup)
+    };
+    if(!users.has(rdp))users.set(rdp,[]);
+    users.get(rdp).push(rec);
+    seen.set(email.toLowerCase(),(seen.get(email.toLowerCase())||0)+1);
+    mailboxes++;
+  }
+  const duplicates=[...seen.values()].filter(n=>n>1).length;
+  if(duplicates)warnings.push(`${duplicates} email address(es) appear more than once.`);
+  return{
+    users:[...users].map(([name,rows])=>({name,rows})),
+    mailboxes,skipped,warnings,
+    proxyFound:c.proxy>=0
+  };
+}
+function scParseSheetHtml(html){
+  const doc=new DOMParser().parseFromString(html,'text/html');
+  for(const table of doc.querySelectorAll('table')){
+    const grid=scBuildGrid(table);
+    const h=scFindHeader(grid);
+    if(h)return scExtract(grid,h);
+  }
+  return{error:'No table with RDP and Email headers was found. Export the Google Sheet as an HTML file and try again.'};
+}
+function scQuote(v){
+  const s=String(v);
+  return /[",\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+}
+function scCsv(rows){
+  const body=rows.map(r=>[r.email,r.password,r.recovery,r.otp,r.proxy,r.backup,''].map(scQuote).join(','));
+  return [SC_HEADER,...body].join('\r\n')+'\r\n';
+}
+function scFileName(name,used){
+  const base=name.replace(/[^A-Za-z0-9._-]+/g,'_').replace(/^_+|_+$/g,'')||'user';
+  let out=base,n=2;
+  while(used.has(out.toLowerCase())){out=`${base}_${n++}`}
+  used.add(out.toLowerCase());
+  return out+'.csv';
+}
+function scBuildFiles(data){
+  const used=new Set();
+  return data.users.map(u=>({name:scFileName(u.name,used),csv:scCsv(u.rows),count:u.rows.length,user:u.name}));
+}
+let scCrcTable=null;
+function scCrc32(u8){
+  if(!scCrcTable){
+    scCrcTable=new Uint32Array(256);
+    for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;scCrcTable[n]=c>>>0}
+  }
+  let crc=0xFFFFFFFF;
+  for(let i=0;i<u8.length;i++)crc=scCrcTable[(crc^u8[i])&0xFF]^(crc>>>8);
+  return (crc^0xFFFFFFFF)>>>0;
+}
+// Minimal ZIP writer (stored entries, UTF-8 names). No dependency, no compression.
+function scZip(files){
+  const enc=new TextEncoder(),chunks=[],central=[];
+  let offset=0;
+  const d=new Date();
+  const dosTime=(d.getHours()<<11)|(d.getMinutes()<<5)|Math.floor(d.getSeconds()/2);
+  const dosDate=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate();
+  for(const f of files){
+    const name=enc.encode(f.name),data=f.data,crc=scCrc32(data),size=data.length;
+    const lh=new DataView(new ArrayBuffer(30));
+    lh.setUint32(0,0x04034b50,true);lh.setUint16(4,20,true);lh.setUint16(6,0x0800,true);lh.setUint16(8,0,true);
+    lh.setUint16(10,dosTime,true);lh.setUint16(12,dosDate,true);lh.setUint32(14,crc,true);
+    lh.setUint32(18,size,true);lh.setUint32(22,size,true);lh.setUint16(26,name.length,true);lh.setUint16(28,0,true);
+    chunks.push(new Uint8Array(lh.buffer),name,data);
+    const ch=new DataView(new ArrayBuffer(46));
+    ch.setUint32(0,0x02014b50,true);ch.setUint16(4,20,true);ch.setUint16(6,20,true);ch.setUint16(8,0x0800,true);ch.setUint16(10,0,true);
+    ch.setUint16(12,dosTime,true);ch.setUint16(14,dosDate,true);ch.setUint32(16,crc,true);
+    ch.setUint32(20,size,true);ch.setUint32(24,size,true);ch.setUint16(28,name.length,true);
+    ch.setUint16(30,0,true);ch.setUint16(32,0,true);ch.setUint16(34,0,true);ch.setUint16(36,0,true);
+    ch.setUint32(38,0,true);ch.setUint32(42,offset,true);
+    central.push(new Uint8Array(ch.buffer),name);
+    offset+=30+name.length+size;
+  }
+  const cdSize=central.reduce((a,u)=>a+u.length,0);
+  const end=new DataView(new ArrayBuffer(22));
+  end.setUint32(0,0x06054b50,true);end.setUint16(8,files.length,true);end.setUint16(10,files.length,true);
+  end.setUint32(12,cdSize,true);end.setUint32(16,offset,true);end.setUint16(20,0,true);
+  return new Blob([...chunks,...central,new Uint8Array(end.buffer)],{type:'application/zip'});
+}
+function scClearState(){
+  scState=null;
+  const f=el('sc-file');if(f)f.value='';
+  if(el('sc-name'))el('sc-name').textContent='No file selected';
+  if(el('sc-summary'))el('sc-summary').innerHTML='';
+  if(el('sc-users'))el('sc-users').innerHTML='';
+  if(el('sc-export'))el('sc-export').disabled=true;
+  scSetMsg('');
+}
+function scSetMsg(text,type){
+  const m=el('sc-msg');if(!m)return;
+  m.className=type||'';m.textContent=text||'';
+  m.style.color=type==='err'?'var(--danger)':type==='warn'?'#b7791f':'';
+}
+function scShowResult(fileName,data){
+  scState=data;
+  el('sc-name').textContent=fileName;
+  el('sc-summary').innerHTML=[
+    ['Users detected',data.users.length],
+    ['Mailboxes detected',data.mailboxes],
+    ['Rows skipped (no RDP user)',data.skipped.noRdp],
+    ['Rows skipped (invalid email)',data.skipped.invalidEmail],
+    ['Proxy column',data.proxyFound?'Found':'Not found']
+  ].map(([k,v])=>`<div><dt>${hpEsc(k)}</dt><dd>${hpEsc(v)}</dd></div>`).join('');
+  scRenderUsers(data);
+  el('sc-export').disabled=data.mailboxes===0;
+  if(data.mailboxes===0)scSetMsg('The file was read, but it contains no valid mailbox records.','err');
+  else if(data.warnings.length)scSetMsg(data.warnings.join(' '),'warn');
+  else scSetMsg(`Ready: ${data.mailboxes} mailbox(es) across ${data.users.length} user(s).`);
+}
+function scLoadFile(file){
+  if(!file)return;
+  scClearState();
+  el('sc-name').textContent=file.name;
+  const rd=new FileReader();
+  rd.onload=()=>{
+    const res=scParseSheetHtml(String(rd.result));
+    if(res.error){scSetMsg(res.error,'err');return}
+    scShowResult(file.name,res);
+  };
+  rd.onerror=()=>scSetMsg('The file could not be read.','err');
+  rd.readAsText(file,'UTF-8');
+}
+function scRenderUsers(data){
+  const files=scBuildFiles(data);
+  el('sc-users').innerHTML=files.map((f,i)=>`<div class="row" style="margin:6px 0"><span style="min-width:220px"><b>${hpEsc(f.user)}</b> &mdash; ${f.count} mailbox(es) &rarr; <code>${hpEsc(f.name)}</code></span><button data-sc-user="${i}">Download CSV</button></div>`).join('');
+}
+// Downloads one user's CSV. Uses the same file list, names, and CSV text as the ZIP export.
+function scDownloadUser(i){
+  if(!scState)return;
+  const f=scBuildFiles(scState)[i];
+  if(!f)return;
+  const blob=new Blob([new TextEncoder().encode(f.csv)],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=f.name;
+  document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast(`Downloaded ${f.name} (${f.count} mailboxes)`);
+}
+function scExportAll(){
+  if(!scState||!scState.mailboxes)return;
+  const files=scBuildFiles(scState);
+  const enc=new TextEncoder();
+  const blob=scZip(files.map(f=>({name:f.name,data:enc.encode(f.csv)})));
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='warmup-csv-export.zip';
+  document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  toast(`Exported ${files.length} CSV file(s) in one ZIP`);
+}
+function mountSeedCsv(root){
+  scClearState();
+  root.innerHTML=`
+  <header class="head"><h1>Seed CSV Exporter</h1><p>Convert a Google Sheets HTML export into Warmup App CSV files, one per RDP user. Everything runs in your browser; the file is never uploaded.</p>
+    <details class="how"><summary>How to use</summary><ol><li>In Google Sheets, export the sheet as an HTML file (File, Download, Web page).</li><li>Choose or drop that file below.</li><li>Check the user and mailbox counts.</li><li>Click Export All CSV Files to download one ZIP with a CSV per user.</li></ol></details></header>
+  <section>
+    <div id="sc-drop" style="border:1px dashed var(--line);border-radius:8px;padding:18px;background:var(--panel);text-align:center">
+      <input type="file" id="sc-file" accept=".html,.htm,text/html" aria-label="Choose Google Sheets HTML export">
+      <div class="hint" style="margin-top:8px">or drop the HTML file here</div>
+    </div>
+    <div class="row"><span style="font-weight:600">File:</span><span id="sc-name" class="hint">No file selected</span></div>
+  </section>
+  <div id="sc-msg" role="status" style="margin:8px 0"></div>
+  <dl class="stats" id="sc-summary"></dl>
+  <div id="sc-users" class="hint" style="margin-top:8px"></div>
+  <div class="row actions"><button class="primary" id="sc-export" disabled>Export All CSV Files</button><button id="sc-reset">Clear imported data</button></div>
+  <p class="hint">Output header: email,password,email_recovery,otp,proxy,backup_codes, (the trailing comma is intentional and is kept on every row).</p>`;
+  const f=el('sc-file'),drop=el('sc-drop');
+  f.onchange=e=>scLoadFile(e.target.files[0]);
+  drop.addEventListener('dragover',e=>{e.preventDefault()});
+  drop.addEventListener('drop',e=>{e.preventDefault();scLoadFile(e.dataTransfer.files[0])});
+  el('sc-export').onclick=scExportAll;
+  el('sc-reset').onclick=scClearState;
+  el('sc-users').onclick=e=>{const b=e.target.closest('button[data-sc-user]');if(b)scDownloadUser(+b.dataset.scUser)};
 }
 
 /* ---------- rendering ---------- */
